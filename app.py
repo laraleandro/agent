@@ -1,16 +1,16 @@
 import os
 import time
 import base64
+import re
 from openai import AzureOpenAI
 import streamlit as st
 
-# Constants
+# --- CONFIG INICIAL ---
 AZURE_API_KEY = st.secrets["azure"]["api_key"]
 AZURE_ENDPOINT = st.secrets["azure"]["endpoint"]
 AZURE_API_VERSION = "2024-05-01-preview"
-MODEL_DEPLOYMENT = "gpt-4o-mini"  # Adjust if your deployment name is different
+MODEL_DEPLOYMENT = "gpt-4o-mini"
 
-# Load assistant role instructions
 def load_instructions(file_path="assistant_role.txt"):
     with open(file_path, "r") as f:
         return f.read().strip()
@@ -19,14 +19,12 @@ ASSISTANT_FILE = "AssistantID.TXT"
 ASSISTANT_NAME = "GroupF_Assistant"
 ASSISTANT_ROLE = load_instructions()
 
-# Initialize OpenAI client
 client = AzureOpenAI(
     api_key=AZURE_API_KEY,
     azure_endpoint=AZURE_ENDPOINT,
     api_version=AZURE_API_VERSION,
 )
 
-# Load or create assistant
 def load_or_create_assistant():
     if os.path.exists(ASSISTANT_FILE):
         with open(ASSISTANT_FILE, "r") as f:
@@ -43,11 +41,23 @@ def load_or_create_assistant():
             f.write(assistant.id)
     return assistant
 
-# Create new thread
 def create_thread():
     return client.beta.threads.create()
 
-# Send message and get response
+def get_file_info(file_id):
+    try:
+        file_obj = client.files.retrieve(file_id)
+        file_name = getattr(file_obj, "filename", None)
+        if not file_name:
+            file_name = getattr(file_obj, "name", None)
+        if not file_name and isinstance(file_obj, dict):
+            file_name = file_obj.get("filename") or file_obj.get("name")
+        if not file_name:
+            file_name = str(file_obj)
+        return file_name
+    except Exception:
+        return file_id
+
 def send_and_get_response(assistant_id, thread_id, message):
     client.beta.threads.messages.create(
         thread_id=thread_id,
@@ -69,67 +79,81 @@ def send_and_get_response(assistant_id, thread_id, message):
         if run_status.status == "completed":
             break
         elif run_status.status in ["failed", "cancelled", "expired"]:
-            return f"{LANG_STRINGS[st.session_state.language]['error_run_failed']} {run_status.status}"
+            return "Erro: execução falhou.", []
         if time.time() - start_time > max_wait:
-            return LANG_STRINGS[st.session_state.language]["error_timeout"]
+            return "Erro: tempo limite de execução excedido.", []
         time.sleep(1)
 
     messages = client.beta.threads.messages.list(thread_id=thread_id)
-    last_message = messages.data[0].content[0].text.value
-    return last_message
+    last_message_obj = messages.data[0]
+    content_block = last_message_obj.content[0]
+    value = getattr(content_block.text, "value", "")
+    annotations = getattr(content_block.text, "annotations", [])
 
-# Paths for logos/icons
+    sources = []
+    citation_map = {}
+    citation_counter = 1
+    for annotation in annotations:
+        if getattr(annotation, "type", "") == "file_citation":
+            file_id = getattr(annotation.file_citation, "file_id", None)
+            marker = getattr(annotation, "text", "")
+            if file_id and marker not in citation_map:
+                citation_map[marker] = citation_counter
+                file_name = get_file_info(file_id)
+                sources.append({"n": citation_counter, "file": file_name})
+                citation_counter += 1
+
+    def replace_marker(match):
+        marker = match.group(0)
+        if marker in citation_map:
+            return f"[{citation_map[marker]}]"
+        return ""
+    clean_message = re.sub(r"【\d+:\d+†source】", replace_marker, value)
+    return clean_message, sources
+
+# --- UI, LOGOS, LOCALE ---
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "fidelidade_logo.png")
 ICON_PATH = os.path.join(os.path.dirname(__file__), "fidelidade_icon.png")
-
 with open(LOGO_PATH, "rb") as f:
     logo_base64 = base64.b64encode(f.read()).decode()
-
 with open(ICON_PATH, "rb") as f:
     icon_base64 = base64.b64encode(f.read()).decode()
 
-# Localization
 LANG_STRINGS = {
-    "English": {
-        "new_chat": "New Chat",
-        "chat_input": "Write your question…",
-        "processing": "Processing…",
-        "error_run_failed": "Error: run failed or was cancelled. Status:",
-        "error_timeout": "Error: execution timeout exceeded.",
-        "reset_button": "🔄 New Chat",
-        "agent_name": "Agent Assistant",
-    },
     "Português": {
         "new_chat": "Novo Chat",
         "chat_input": "Escreva a sua pergunta…",
         "processing": "A processar…",
-        "error_run_failed": "Erro: a execução falhou ou foi cancelada. Status:",
-        "error_timeout": "Erro: tempo limite de execução excedido.",
-        "reset_button": "🔄 Novo Chat",
         "agent_name": "Assistente Virtual",
+        "sources": "Fontes"
+    },
+    "English": {
+        "new_chat": "New Chat",
+        "chat_input": "Write your question…",
+        "processing": "Processing…",
+        "agent_name": "Agent Assistant",
+        "sources": "Sources"
     }
 }
 
-# Session state initialization
+# --- SESSION STATE ---
 if "language" not in st.session_state:
     st.session_state.language = "Português"
-
 if "assistant" not in st.session_state:
     st.session_state.assistant = load_or_create_assistant()
-
 if "thread" not in st.session_state:
     st.session_state.thread = create_thread()
-
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = []
 
-# Colors (fixed theme)
+# --- CSS, HEADER ---
 primary_red = "#C80A1E"
 light_grey = "#F5F5F5"
 bg_color = "white"
 text_color = "black"
 
-# Page configuration
 st.set_page_config(
     page_title=LANG_STRINGS[st.session_state.language]["agent_name"],
     page_icon=ICON_PATH,
@@ -137,76 +161,27 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Sidebar UI
-with st.sidebar:
-    if st.button(LANG_STRINGS[st.session_state.language]["new_chat"]):
-        for key in ("assistant", "thread", "chat_history"):
-            st.session_state.pop(key, None)
-        st.session_state.assistant = load_or_create_assistant()
-        st.session_state.thread = create_thread()
-        st.session_state.chat_history = []
-
-    selected_language = st.selectbox(
-        "Language / Idioma",
-        options=["Português", "English"],
-        index=0 if st.session_state.language == "Português" else 1,
-        key="language_selector"
-    )
-    st.session_state.language = selected_language
-
-# Global CSS styling
 st.markdown(
     f"""
     <style>
-    .main {{
-        background-color: {bg_color};
-        color: {text_color};
-    }}
-    div.block-container, section.main.block-container {{
-        padding-top: 0 !important;
-        margin-top: 0 !important;
-    }}
-    header {{
-        margin-top: 0 !important;
-        padding-top: 0 !important;
-    }}
+    .main {{ background-color: {bg_color}; color: {text_color}; }}
+    div.block-container, section.main.block-container {{ padding-top: 0 !important; margin-top: 0 !important; }}
+    header {{ margin-top: 0 !important; padding-top: 0 !important; }}
     .stChatMessage:nth-child(odd) div[class^='stChatMessage'] {{
-        background: {primary_red};
-        color: white;
-        border-radius: 8px;
+        background: {primary_red}; color: white; border-radius: 8px;
     }}
     .stChatMessage:nth-child(even) div[class^='stChatMessage'] {{
-        background: {light_grey};
-        color: {text_color};
-        border-radius: 8px;
+        background: {light_grey}; color: {text_color}; border-radius: 8px;
     }}
-    .stChatMessage {{
-        display: flex !important;
-        align-items: flex-start !important;
-        gap: 0.5rem;
-    }}
-    .stChatMessage > div.stAvatar {{
-        flex-shrink: 0;
-        margin-top: 0.2rem;
-    }}
-    .stChatMessage > div[class^='stChatMessage'] {{
-        padding: 0.75rem 1rem !important;
-        border-radius: 8px !important;
-        flex-grow: 1;
-    }}
-    .stChatMessage > div {{
-        padding: 0 !important;
-    }}
-    h2 {{
-        margin: 0 !important;
-        line-height: 1 !important;
-    }}
+    .stChatMessage {{ display: flex !important; align-items: flex-start !important; gap: 0.5rem; }}
+    .stChatMessage > div.stAvatar {{ flex-shrink: 0; margin-top: 0.2rem; }}
+    .stChatMessage > div[class^='stChatMessage'] {{ padding: 0.75rem 1rem !important; border-radius: 8px !important; flex-grow: 1; }}
+    .stChatMessage > div {{ padding: 0 !important; }}
+    h2 {{ margin: 0 !important; line-height: 1 !important; }}
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-# Header with logo and assistant name
 st.markdown(
     f"""
     <div style="display: flex; align-items: center; gap: 1.2rem; padding: 1rem 0; margin-top: 12px;">
@@ -217,19 +192,44 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Chat input and processing
+# --- CHAT INPUT & ATUALIZAÇÃO DO STATE ---
 user_input = st.chat_input(LANG_STRINGS[st.session_state.language]["chat_input"])
 if user_input:
     with st.spinner(LANG_STRINGS[st.session_state.language]["processing"]):
-        reply = send_and_get_response(
+        reply, sources = send_and_get_response(
             st.session_state.assistant.id,
             st.session_state.thread.id,
             user_input,
         )
     st.session_state.chat_history.append(("user", user_input))
     st.session_state.chat_history.append(("assistant", reply))
+    st.session_state.last_sources = sources
 
-# Render chat history
+# --- SIDEBAR: mostra as fontes da última resposta do assistente ---
+with st.sidebar:
+    if st.button(LANG_STRINGS[st.session_state.language]["new_chat"]):
+        for key in ("assistant", "thread", "chat_history", "last_sources"):
+            st.session_state.pop(key, None)
+        st.session_state.assistant = load_or_create_assistant()
+        st.session_state.thread = create_thread()
+        st.session_state.chat_history = []
+        st.session_state.last_sources = []
+        st.experimental_rerun()
+
+    selected_language = st.selectbox(
+        "Language / Idioma",
+        options=["Português", "English"],
+        index=0 if st.session_state.language == "Português" else 1,
+        key="language_selector"
+    )
+    st.session_state.language = selected_language
+
+    if st.session_state.last_sources:
+        st.markdown(f"### {LANG_STRINGS[st.session_state.language]['sources']}")
+        for source in st.session_state.last_sources:
+            st.markdown(f'[{source["n"]}] {source["file"]}')
+
+# --- RENDER CHAT HISTORY ---
 for role, msg in st.session_state.chat_history:
     if role == "user":
         with st.chat_message("user"):
