@@ -1,0 +1,8 @@
+streamlit
+openai>=0.27.0
+numpy
+requests
+soundfile
+streamlit-webrtc
+av
+reportlab
